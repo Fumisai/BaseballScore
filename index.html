@@ -30,7 +30,7 @@ type Outcome = {
   code: OutcomeCode;
   defensive: string | null;
   description: string;
-  flyDir?: 7 |const dirs = (flyDirConfig.default && flyDirConfig.default.length ? flyDirConfig.default : [7,8,8,9]) as Array<7|8|9>; // センター寄り厚め（外部反映）| 9 | null;
+  flyDir?: 7 | 8 | 9 | null;
   // 採点前プレビュー用：模範の「走者進塁」テキスト
   previewAdvance?: string;
 };
@@ -112,11 +112,7 @@ function baseOutKey(outs: number, bases: Bases) {
   const b2 = bases[2] ? 1 : 0;
   const b3 = bases[3] ? 1 : 0;
   return `O${outs}_B${b1}${b2}${b3}`;
-}(outs: number, bases: Bases) {
-  const b1 = bases[1] ? 1 : 0;
-  const b2 = bases[2] ? 1 : 0;
-  const b3 = bases[3] ? 1 : 0;
-  return `O${outs}_B${b1}${b2}${b3}`;
+}_B${b1}${b2}${b3}`;
 }
 
 // ===================== モック選手・打順 =====================
@@ -187,10 +183,14 @@ const initialGame = (): Game => ({
 
 // ===================== プレイ生成 =====================
 
-function generateOutcome(ctx: { outs: number; bases: Bases }): Outcome {
+function generateOutcome(
+  ctx: { outs: number; bases: Bases },
+  cfgProb: ProbConfig,
+  cfgFly: FlyDirConfig
+): Outcome {
   const { outs, bases } = ctx;
   const key = baseOutKey(outs, bases);
-  const table = probConfig[key];
+  const table = cfgProb[key];
   let candidates: Array<{ code: OutcomeCode; w: number }> = [];
 
   if (table) {
@@ -223,7 +223,7 @@ function generateOutcome(ctx: { outs: number; bases: Bases }): Outcome {
   // フライ方向の分岐強化
   let flyDir: 7 | 8 | 9 | null = null;
   if (code === "FO") {
-    const dirsPool: Array<7 | 8 | 9> = [7, 8, 8, 9]; // センター寄り厚め
+    const dirs: Array<7 | 8 | 9> = (cfgFly.default && cfgFly.default.length ? cfgFly.default : [7, 8, 8, 9]) as Array<7 | 8 | 9>; // センター寄り厚め（外部反映）
     flyDir = randChoice(dirs);
   }
 
@@ -599,39 +599,10 @@ export default function ScorebookTrainer() {
   const [configInfo, setConfigInfo] = useState<string>("defaults");
 
   // 起動時に /config/*.json をフェッチ（存在しない場合はフォールバック）
-  React.useEffect(() => {
-    async function loadJSON(path: string) {
-      try {
-        const res = await fetch(path, { cache: "no-store" });
-        if (!res.ok) throw new Error(`${path} HTTP ${res.status}`);
-        return await res.json();
-      } catch (e) {
-        return null;
-      }
-    }
-    (async () => {
-      const [pc, fd, re, na] = await Promise.all([
-        loadJSON("/config/prob_config.json"),
-        loadJSON("/config/fly_dir.json"),
-        loadJSON("/config/run_expectancy.json"),
-        loadJSON("/config/notation_alias.json"),
-      ]);
-      let used = [] as string[];
-      if (pc) { setProbConfig(pc as ProbConfig); used.push("prob"); }
-      if (fd) { setFlyDirConfig(fd as FlyDirConfig); used.push("fly"); }
-      if (re) { setRunExpectancy(re as RunExpectancy); used.push("re"); }
-      if (na) { setNotationAlias(na as NotationAlias); used.push("alias"); }
-      setConfigInfo(used.length ? `external(${used.join(",")})` : "defaults");
-    })();
-  }, []);
-  // 外部設定（JSON）の状態
-  const [probConfig, setProbConfig] = useState<ProbConfig>(DEFAULT_PROB_CONFIG);
-  const [flyDirConfig, setFlyDirConfig] = useState<FlyDirConfig>(DEFAULT_FLY_DIR);
-  const [runExpectancy, setRunExpectancy] = useState<RunExpectancy>(DEFAULT_RUN_EXPECTANCY);
-  const [notationAlias, setNotationAlias] = useState<NotationAlias>(DEFAULT_NOTATION_ALIAS);
-  const [configInfo, setConfigInfo] = useState<string>("defaults");
+  // 設定ファイルのベースパス（デフォルトは /config）。GitHub Pages 等でパスを変える場合は
+  // window.__CONFIG_BASE__ = "/your/subdir/config" を index.html などで定義してください。
+  const CONFIG_BASE = (typeof window !== 'undefined' && (window as any).__CONFIG_BASE__) || "/config";
 
-  // 起動時に /config/*.json をフェッチ（存在しない場合はフォールバック）
   React.useEffect(() => {
     async function loadJSON(path: string) {
       try {
@@ -644,10 +615,10 @@ export default function ScorebookTrainer() {
     }
     (async () => {
       const [pc, fd, re, na] = await Promise.all([
-        loadJSON("/config/prob_config.json"),
-        loadJSON("/config/fly_dir.json"),
-        loadJSON("/config/run_expectancy.json"),
-        loadJSON("/config/notation_alias.json"),
+        loadJSON(`${CONFIG_BASE}/prob_config.json`),
+        loadJSON(`${CONFIG_BASE}/fly_dir.json`),
+        loadJSON(`${CONFIG_BASE}/run_expectancy.json`),
+        loadJSON(`${CONFIG_BASE}/notation_alias.json`),
       ]);
       let used = [] as string[];
       if (pc) { setProbConfig(pc as ProbConfig); used.push("prob"); }
@@ -697,7 +668,7 @@ export default function ScorebookTrainer() {
     const gSub = maybeTriggerSubstitution(game);
     if (gSub !== game) setGame(gSub);
 
-    const o = generateOutcome({ outs: gSub.outs, bases: gSub.bases });
+    const o = generateOutcome({ outs: gSub.outs, bases: gSub.bases }, probConfig, flyDirConfig);
     // 進塁プレビュー（打席結果の横表示用）
     const gBefore = deepClone(gSub);
     const gAfter = applyPlay(gBefore, batter, o);
@@ -781,15 +752,9 @@ export default function ScorebookTrainer() {
     console.assert(key2 === "O1_B101", "baseOutKey mismatch #2");
 
     // 2) FO の方向が 7/8/9 のいずれかになること（100回試行）
-    let</header>
-
-        {/* コンフィグ状態の表示（外部JSON読み込み状況） */}
-        <section className="bg-white rounded-2xl shadow p-4">
-          <div className="text-sm text-gray-500">設定ファイル: {configInfo}</div>
-          <div className="text-xs text-gray-500">/config/prob_config.json, /config/fly_dir.json, /config/run_expectancy.json, /config/notation_alias.json（存在しなければデフォルト）</div>
-        </section>rue;
+    let okFO = true;
     for (let i = 0; i < 100; i++) {
-      const o = generateOutcome({ outs: 0, bases: { 1: null, 2: null, 3: null } });
+      const o = generateOutcome({ outs: 0, bases: { 1: null, 2: null, 3: null } }, probConfig, flyDirConfig);
       if (o.code === "FO") {
         if (!(o.flyDir === 7 || o.flyDir === 8 || o.flyDir === 9 || o.flyDir === null)) okFO = false;
       }
@@ -805,7 +770,13 @@ export default function ScorebookTrainer() {
     logs.push(`TEST applyPlay 1B move R1 => ${movedR1 ? "OK" : "NG"}`);
     console.assert(movedR1, "applyPlay single advance R1 failed");
 
-    return logs.join("\n");
+    // 4) 追加: baseOutKey #3 複合
+    const key3 = baseOutKey(2, { 1: "R1", 2: "R2", 3: null });
+    logs.push(`TEST baseOutKey #3 => ${key3}`);
+    console.assert(key3 === "O2_B110", "baseOutKey mismatch #3");
+
+    return logs.join("
+");
   });
 
   return (
@@ -821,6 +792,12 @@ export default function ScorebookTrainer() {
             {game.gameOver && <span className="ml-2 text-red-600 font-semibold">（試合終了）</span>}
           </div>
         </header>
+
+        {/* コンフィグ状態の表示（外部JSON読み込み状況） */}
+        <section className="bg-white rounded-2xl shadow p-4">
+          <div className="text-sm text-gray-500">設定ファイル: {configInfo}</div>
+          <div className="text-xs text-gray-500">/config/prob_config.json, /config/fly_dir.json, /config/run_expectancy.json, /config/notation_alias.json（存在しなければデフォルト）</div>
+        </section>
 
         {/* スコアボード */}
         <section className="bg-white rounded-2xl shadow p-4">
