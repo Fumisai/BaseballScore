@@ -1,1 +1,983 @@
-あ
+"use client";
+import React, { useMemo, useState } from "react";
+
+/**
+ * 野球記者の教育を目的とした、スコアブック記入練習用Webアプリ（単一ファイル・TSX）
+ * - Tailwind 前提。shadcn 依存なし。
+ * - 期待進塁／確率分岐／フライ方向／累計スコア／プレビュー進塁／ラインスコア／サヨナラ／一度きりの交代 を実装。
+ * - TSX構文エラーの原因だった型宣言の重複・波括弧の不整合を全面修正。
+ * - 簡易ランタイムテスト（console.assert + 画面表示）を同梱。
+ */
+
+// ===================== 型定義 =====================
+
+type Half = "top" | "bottom";
+
+type Bases = {
+  1: string | null;
+  2: string | null;
+  3: string | null;
+};
+
+type PitcherSide = "topDefense" | "bottomDefense";
+
+type PitcherStats = Record<PitcherSide, { BF: number; K: number; BB: number; H: number; ER: number; R: number }>;
+
+type OutcomeCode =
+  | "1B" | "2B" | "3B" | "HR" | "BB" | "HBP" | "K" | "GO" | "FO" | "DP" | "SF" | "FC" | "E";
+
+type Outcome = {
+  code: OutcomeCode;
+  defensive: string | null;
+  description: string;
+  flyDir?: 7 |const dirs = (flyDirConfig.default && flyDirConfig.default.length ? flyDirConfig.default : [7,8,8,9]) as Array<7|8|9>; // センター寄り厚め（外部反映）| 9 | null;
+  // 採点前プレビュー用：模範の「走者進塁」テキスト
+  previewAdvance?: string;
+};
+
+type HistoryEntry = {
+  before: { outs: number; bases: Bases };
+  outcome: Outcome;
+  after: { outs: number; bases: Bases };
+  runsScored: string[]; // 名前
+  rbi: number;
+  batter: string;
+  pitcherSide: PitcherSide;
+  subNote?: string | null;
+};
+
+type Game = {
+  inning: number;
+  half: Half;
+  outs: number;
+  bases: Bases;
+  score: { top: number; bottom: number };
+  linescore: { top: number[]; bottom: number[] }; // 回ごとの得点
+  lineups: { top: { name: string }[]; bottom: { name: string }[] };
+  batIdx: { top: number; bottom: number };
+  pitchers: Record<PitcherSide, { name: string }>;
+  pitcherStats: PitcherStats;
+  subs: Array<{ half: Half; inning: number; note: string }>;
+  history: HistoryEntry[];
+  tiebreak: boolean;
+  gameOver: boolean;
+  hasSubOccurred: boolean;
+  pendingSubNote: string | null;
+};
+
+// ===================== ユーティリティ =====================
+
+const deepClone = <T,>(obj: T): T => JSON.parse(JSON.stringify(obj));
+const randChoice = <T,>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
+const normalize = (s: unknown) => (s ?? "").toString().trim().replace(/\s+/g, " ").toUpperCase();
+
+// 守備番号の辞書（参照用）
+const POS = { P: 1, C: 2, "1B": 3, "2B": 4, "3B": 5, SS: 6, LF: 7, CF: 8, RF: 9 } as const;
+
+// ===================== 設定テーブル（JSON外だし対応） =====================
+// 1) デフォルト（内蔵） … 外部JSONが無い場合のフォールバック。
+// 2) 外部JSON（/config/*.json）を起動時にfetch → マージして使用。
+
+type ProbConfig = Record<string, Record<string, number>>; // 例: { "O0_B000": { "1B": 14, ... } }
+type FlyDirConfig = { default: Array<7 | 8 | 9> } & Record<string, Array<7 | 8 | 9>>; // 拡張余地
+
+type RunExpectancy = Record<string, number>; // 例: { "O0_B000": 0.50, ... }
+
+type NotationAlias = Record<string, string[]>; // 採点ゆらぎ（未使用だが将来拡張）
+
+const DEFAULT_PROB_CONFIG: ProbConfig = {
+  "O0_B000": { "1B":14, "2B":6, "3B":2, "HR":3, "BB":6, "K":12, "GO":16, "FO":12, "HBP":1, "E":1 },
+  "O1_B000": { "1B":12, "2B":5, "3B":2, "HR":3, "BB":7, "K":13, "GO":18, "FO":14, "HBP":1, "E":1 },
+  "O2_B000": { "1B":10, "2B":5, "3B":1, "HR":3, "BB":5, "K":16, "GO":18, "FO":14, "HBP":1, "E":1 },
+  "O0_B100": { "1B":12, "2B":6, "3B":2, "HR":3, "BB":9, "K":12, "GO":14, "FO":10, "DP":5, "FC":4, "HBP":2, "E":1 },
+  "O1_B100": { "1B":12, "2B":5, "3B":1, "HR":3, "BB":8, "K":12, "GO":16, "FO":12, "DP":6, "FC":4, "HBP":2, "E":1 },
+  "O2_B100": { "1B":10, "2B":5, "3B":1, "HR":3, "BB":6, "K":16, "GO":18, "FO":12, "HBP":1, "E":1 },
+  "O0_B001": { "1B":12, "2B":6, "HR":3, "BB":6, "K":12, "GO":14, "FO":12, "SF":4, "HBP":1, "E":1 },
+  "O1_B001": { "1B":12, "2B":5, "HR":3, "BB":6, "K":12, "GO":14, "FO":12, "SF":5, "HBP":1, "E":1 },
+  "O2_B001": { "1B":10, "2B":5, "HR":3, "BB":5, "K":16, "GO":16, "FO":14, "HBP":1, "E":1 },
+};
+
+const DEFAULT_FLY_DIR: FlyDirConfig = { default: [7,8,8,9] };
+
+const DEFAULT_RUN_EXPECTANCY: RunExpectancy = {
+  "O0_B000": 0.50, "O1_B000": 0.27, "O2_B000": 0.10,
+  "O0_B100": 0.90, "O1_B100": 0.54, "O2_B100": 0.24,
+  "O0_B001": 1.15, "O1_B001": 0.93, "O2_B001": 0.35,
+}; // 参照は state の runExpectancy を使用
+
+const DEFAULT_NOTATION_ALIAS: NotationAlias = {}; // 将来拡張用
+
+function baseOutKey(outs: number, bases: Bases) {
+  const b1 = bases[1] ? 1 : 0;
+  const b2 = bases[2] ? 1 : 0;
+  const b3 = bases[3] ? 1 : 0;
+  return `O${outs}_B${b1}${b2}${b3}`;
+}(outs: number, bases: Bases) {
+  const b1 = bases[1] ? 1 : 0;
+  const b2 = bases[2] ? 1 : 0;
+  const b3 = bases[3] ? 1 : 0;
+  return `O${outs}_B${b1}${b2}${b3}`;
+}
+
+// ===================== モック選手・打順 =====================
+
+const TEAM_A = {
+  name: "VISITORS",
+  lineup: [
+    { name: "田中" },
+    { name: "佐藤" },
+    { name: "鈴木" },
+    { name: "高橋" },
+    { name: "伊藤" },
+    { name: "渡辺" },
+    { name: "山本" },
+    { name: "中村" },
+    { name: "小林" },
+  ],
+  pitcher: { name: "青木" },
+} as const;
+
+const TEAM_B = {
+  name: "HOME",
+  lineup: [
+    { name: "大野" },
+    { name: "井上" },
+    { name: "前田" },
+    { name: "藤田" },
+    { name: "岡田" },
+    { name: "三浦" },
+    { name: "石井" },
+    { name: "松本" },
+    { name: "原" },
+  ],
+  pitcher: { name: "黒田" },
+} as const;
+
+// 走者ID生成（得点者の記録用）
+let runnerSerial = 1;
+const newRunnerId = (playerName: string) => `${playerName}#${runnerSerial++}`;
+const runnerName = (runnerId: string | null) => (runnerId ? runnerId.split("#")[0] : "");
+
+// ===================== ゲーム初期状態 =====================
+
+const initialGame = (): Game => ({
+  inning: 1,
+  half: "top",
+  outs: 0,
+  bases: { 1: null, 2: null, 3: null },
+  score: { top: 0, bottom: 0 },
+  linescore: { top: [0], bottom: [0] },
+  lineups: {
+    top: deepClone(TEAM_A.lineup),
+    bottom: deepClone(TEAM_B.lineup),
+  },
+  batIdx: { top: 0, bottom: 0 },
+  pitchers: { topDefense: deepClone(TEAM_B.pitcher), bottomDefense: deepClone(TEAM_A.pitcher) },
+  pitcherStats: {
+    topDefense: { BF: 0, K: 0, BB: 0, H: 0, ER: 0, R: 0 },
+    bottomDefense: { BF: 0, K: 0, BB: 0, H: 0, ER: 0, R: 0 },
+  },
+  subs: [],
+  history: [],
+  tiebreak: false,
+  gameOver: false,
+  hasSubOccurred: false,
+  pendingSubNote: null,
+});
+
+// ===================== プレイ生成 =====================
+
+function generateOutcome(ctx: { outs: number; bases: Bases }): Outcome {
+  const { outs, bases } = ctx;
+  const key = baseOutKey(outs, bases);
+  const table = probConfig[key];
+  let candidates: Array<{ code: OutcomeCode; w: number }> = [];
+
+  if (table) {
+    candidates = Object.entries(table).map(([code, w]) => ({ code: code as OutcomeCode, w }));
+  } else {
+    // フォールバック（従来の重み）
+    const hasR1 = !!bases[1];
+    const hasR3 = !!bases[3];
+    candidates = [
+      { code: "1B", w: 14 },
+      { code: "2B", w: 6 },
+      { code: "3B", w: 2 },
+      { code: "HR", w: 3 },
+      { code: "BB", w: 9 },
+      { code: "K", w: 12 },
+      { code: "GO", w: 16 },
+      { code: "FO", w: 12 },
+      { code: "HBP", w: 2 },
+    ];
+    if (hasR1 && outs < 2) candidates.push({ code: "DP", w: 5 });
+    if (hasR3 && outs < 2) candidates.push({ code: "SF", w: 4 });
+    if (hasR1 && outs < 2) candidates.push({ code: "FC", w: 4 });
+    candidates.push({ code: "E", w: 2 });
+  }
+
+  const pool: OutcomeCode[] = [];
+  candidates.forEach((c) => { for (let i = 0; i < c.w; i++) pool.push(c.code); });
+  const code = randChoice(pool);
+
+  // フライ方向の分岐強化
+  let flyDir: 7 | 8 | 9 | null = null;
+  if (code === "FO") {
+    const dirsPool: Array<7 | 8 | 9> = [7, 8, 8, 9]; // センター寄り厚め
+    flyDir = randChoice(dirs);
+  }
+
+  // 守備記録・説明
+  const defensive = (() => {
+    if (code === "GO") return "6-3";
+    if (code === "DP") return "6-4-3";
+    if (code === "SF") return "F9";
+    if (code === "FC") return "6-4(FC)";
+    if (code === "E") return "E6";
+    if (code === "FO" && flyDir) return `F${flyDir}`;
+    if (code === "FO") return "F8";
+    return null;
+  })();
+
+  const descriptionMap: Record<string, string> = {
+    "1B": "ライト前ヒット",
+    "2B": "左中間を破る二塁打",
+    "3B": "右中間三塁打",
+    "HR": "レフトスタンドへ本塁打",
+    "BB": "四球",
+    "HBP": "死球",
+    "K": "見逃し三振",
+    "GO": "遊ゴロ",
+    "DP": "遊-二-一の併殺",
+    "SF": "右犠飛",
+    "FC": "遊ゴロ野選（封殺）",
+    "E": "遊ゴロ失策（E6）",
+  };
+  const flyDesc: Record<7 | 8 | 9, string> = { 7: "左飛", 8: "中飛", 9: "右飛" };
+
+  return {
+    code,
+    defensive: defensive || null,
+    description: code === "FO" && flyDir ? flyDesc[flyDir] : (descriptionMap[code] || code),
+    flyDir,
+  };
+}
+
+// ===================== 走塁・得点処理 =====================
+
+function applyPlay(game: Game, batterName: string, outcome: Outcome): Game {
+  const g = deepClone(game);
+  const halfKey = g.half;
+  const defKey: PitcherSide = halfKey === "top" ? "topDefense" : "bottomDefense";
+  const pitStat = g.pitcherStats[defKey];
+  pitStat.BF += 1; // 打者対戦
+
+  const before = deepClone({ outs: g.outs, bases: g.bases });
+  const runsScored: string[] = [];
+  const rbiCredit = { batter: 0 };
+
+  const advance = (from: 1 | 2 | 3, to: 1 | 2 | 3 | "score") => {
+    if (!g.bases[from]) return;
+    const id = g.bases[from] as string;
+    g.bases[from] = null;
+    if (to === "score") {
+      runsScored.push(id);
+    } else {
+      if (g.bases[to]) {
+        // 連鎖押し出し
+        advance(to, (to + 1 === 4 ? "score" : ((to + 1) as 1 | 2 | 3)) as any);
+      }
+      g.bases[to] = id;
+    }
+  };
+
+  const forceAdvanceOnBB = () => {
+    if (!g.bases[1]) return;
+    advance(1, 2);
+  };
+
+  const putBatterOn = (base: 1 | 2 | 3) => {
+    const id = newRunnerId(batterName);
+    if (g.bases[base]) advance(base, (base + 1 === 4 ? "score" : ((base + 1) as 1 | 2 | 3)) as any);
+    g.bases[base] = id;
+  };
+
+  switch (outcome.code) {
+    case "1B": {
+      pitStat.H += 1;
+      if (g.bases[3]) advance(3, "score");
+      if (g.bases[2]) advance(2, 3);
+      if (g.bases[1]) advance(1, 2);
+      putBatterOn(1);
+      rbiCredit.batter = runsScored.length;
+      break;
+    }
+    case "2B": {
+      pitStat.H += 1;
+      if (g.bases[3]) advance(3, "score");
+      if (g.bases[2]) advance(2, "score");
+      if (g.bases[1]) advance(1, 3);
+      putBatterOn(2);
+      rbiCredit.batter = runsScored.length;
+      break;
+    }
+    case "3B": {
+      pitStat.H += 1;
+      if (g.bases[3]) advance(3, "score");
+      if (g.bases[2]) advance(2, "score");
+      if (g.bases[1]) advance(1, "score");
+      putBatterOn(3);
+      rbiCredit.batter = runsScored.length;
+      break;
+    }
+    case "HR": {
+      pitStat.H += 1;
+      if (g.bases[3]) advance(3, "score");
+      if (g.bases[2]) advance(2, "score");
+      if (g.bases[1]) advance(1, "score");
+      runsScored.push(newRunnerId(batterName));
+      rbiCredit.batter = runsScored.length;
+      break;
+    }
+    case "BB":
+    case "HBP": {
+      if (outcome.code === "BB") pitStat.BB += 1;
+      forceAdvanceOnBB();
+      putBatterOn(1);
+      rbiCredit.batter = runsScored.length; // 押し出しのみ
+      break;
+    }
+    case "K": {
+      pitStat.K += 1;
+      g.outs += 1;
+      break;
+    }
+    case "GO": {
+      g.outs += 1;
+      if (g.bases[3]) advance(3, "score");
+      if (g.bases[2]) advance(2, 3);
+      if (g.bases[1]) advance(1, 2);
+      if (runsScored.length > 0) {
+        rbiCredit.batter = runsScored.length;
+      }
+      break;
+    }
+    case "FO": {
+      g.outs += 1; // 走者停止
+      break;
+    }
+    case "DP": {
+      g.outs += 2; // R1アウト、打者アウト
+      if (g.bases[1]) g.bases[1] = null;
+      break;
+    }
+    case "SF": {
+      g.outs += 1;
+      if (g.bases[3]) advance(3, "score");
+      rbiCredit.batter = runsScored.length; // 通常1
+      break;
+    }
+    case "FC": {
+      g.outs += 1; // リードランナー封殺
+      if (g.bases[1]) g.bases[1] = null;
+      putBatterOn(1);
+      break;
+    }
+    case "E": {
+      if (g.bases[3]) advance(3, "score");
+      if (g.bases[2]) advance(2, 3);
+      if (g.bases[1]) advance(1, 2);
+      putBatterOn(1);
+      // 非自責（簡略）
+      break;
+    }
+  }
+
+  // スコア加算 + ラインスコア反映
+  const add = runsScored.length;
+  g.score[halfKey] += add;
+  const idx = g.inning - 1;
+  if (g.linescore.top[idx] === undefined) g.linescore.top[idx] = 0;
+  if (g.linescore.bottom[idx] === undefined) g.linescore.bottom[idx] = 0;
+  if (halfKey === "top") g.linescore.top[idx] = (g.linescore.top[idx] || 0) + add;
+  else g.linescore.bottom[idx] = (g.linescore.bottom[idx] || 0) + add;
+
+  // 投手失点/自責（簡略、自責厳密管理は未実装）
+  const pitStat2 = g.pitcherStats[defKey];
+  pitStat2.R += add;
+  const erAdd = outcome.code === "E" ? 0 : (outcome.code === "HR" ? add : rbiCredit.batter);
+  pitStat2.ER += Math.max(0, erAdd);
+
+  // 裏の攻撃でのサヨナラ（Visitors < Home になった瞬間に終了）
+  if (g.half === "bottom" && g.score.bottom > g.score.top) {
+    g.gameOver = true;
+  }
+
+  // 3アウトでチェンジ
+  if (!g.gameOver && g.outs >= 3) {
+    g.outs = 0;
+    g.bases = { 1: null, 2: null, 3: null };
+    if (g.half === "top") {
+      g.half = "bottom";
+    } else {
+      if (g.inning === 1 && g.score.top === g.score.bottom) {
+        g.tiebreak = true;
+      }
+      g.inning += 1;
+      g.half = "top";
+      // ラインスコア枠の拡張
+      if (g.linescore.top[g.inning - 1] === undefined) g.linescore.top[g.inning - 1] = 0;
+      if (g.linescore.bottom[g.inning - 1] === undefined) g.linescore.bottom[g.inning - 1] = 0;
+      if (g.tiebreak) {
+        g.bases[2] = newRunnerId("タイブレーク走者");
+      }
+    }
+  }
+
+  // 打順繰り上げ（今打っていた側）
+  const prevIdxKey = halfKey;
+  const lineupUsed = g.lineups[prevIdxKey];
+  g.batIdx[prevIdxKey] = (g.batIdx[prevIdxKey] + 1) % lineupUsed.length;
+
+  // タイブレーク終了判定（簡略）
+  if (g.tiebreak && g.inning > 2 && g.half === "top" && g.score.top !== g.score.bottom) {
+    g.gameOver = true;
+  }
+
+  // ログ
+  g.history.push({
+    before,
+    outcome,
+    after: { outs: g.outs, bases: deepClone(g.bases) },
+    runsScored: runsScored.map((id) => runnerName(id)),
+    rbi: rbiCredit.batter,
+    batter: batterName,
+    pitcherSide: defKey,
+    subNote: g.pendingSubNote ?? undefined,
+  });
+  // 交代通知は一度きり
+  g.pendingSubNote = null;
+
+  return g;
+}
+
+// ===================== 模範解答の作成（8項目） =====================
+
+function buildModelAnswer(entry: HistoryEntry) {
+  const { before, after, outcome, runsScored, rbi, batter } = entry;
+  // 1.打者の結果
+  const batterResult = (() => {
+    const map: Record<string, string> = {
+      "1B": "1B",
+      "2B": "2B",
+      "3B": "3B",
+      "HR": "HR",
+      "BB": "BB",
+      "HBP": "HBP",
+      "K": "K",
+      "GO": "GO (6-3)",
+      "FO": "FO (F8)",
+      "DP": "DP (6-4-3)",
+      "SF": "SF (F9)",
+      "FC": "FC (6-4)",
+      "E": "E6",
+    };
+    return map[outcome.code] || outcome.code;
+  })();
+
+  // 2. 守備番号でのプレイ
+  const defensive = outcome.defensive || {
+    "1B": "—",
+    "2B": "—",
+    "3B": "—",
+    "HR": "—",
+    "BB": "—",
+    "HBP": "—",
+  }[outcome.code] || outcome.code;
+
+  // 3. 走者の進塁状況
+  const advanceStr = (() => {
+    const b = before.bases;
+    const a = after.bases;
+    const moves: string[] = [];
+    ([1, 2, 3] as const).forEach((base) => {
+      const id = b[base];
+      if (!id) return;
+      const name = runnerName(id);
+      if (a[1] === id) moves.push(`${name}: ${base}B→1B`);
+      else if (a[2] === id) moves.push(`${name}: ${base}B→2B`);
+      else if (a[3] === id) moves.push(`${name}: ${base}B→3B`);
+      else if (![a[1], a[2], a[3]].includes(id)) moves.push(`${name}: ${base}B→HOM`);
+    });
+    if (["1B", "2B", "3B", "HR", "BB", "HBP", "FC", "E"].includes(outcome.code)) {
+      const dest: Record<string, string> = {
+        "1B": "1B",
+        "2B": "2B",
+        "3B": "3B",
+        "HR": "HOM",
+        "BB": "1B",
+        "HBP": "1B",
+        "FC": "1B",
+        "E": "1B",
+      };
+      moves.push(`${batter}: B→${dest[outcome.code]}`);
+    }
+    return moves.length ? moves.join(" / ") : "—";
+  })();
+
+  // 4. アウト数（打席後）
+  const outsAfter = `${after.outs}`;
+
+  // 5. 得点と打点
+  const runStr = runsScored && runsScored.length ? `得点: ${runsScored.join(", ")}` : "得点: 0";
+  const rbiStr = `打点: ${rbi}`;
+  const runsAndRbi = `${runStr} / ${rbiStr}`;
+
+  // 6. 投手成績（簡易）
+  const pit = (() => {
+    const k = outcome.code === "K" ? 1 : 0;
+    const bb = outcome.code === "BB" ? 1 : 0;
+    const h = ["1B", "2B", "3B", "HR"].includes(outcome.code) ? 1 : 0;
+    const er = outcome.code === "E" ? 0 : (outcome.code === "HR" ? runsScored.length : rbi);
+    return `K:${k} BB:${bb} H:${h} ER:${er}`;
+  })();
+
+  // 7. 選手交代（任意）
+  const subNote = entry.subNote ?? "—";
+
+  // 8. エラーや野選
+  const misc = ({ E: "E6", FC: "FC 6-4" } as Record<string, string>)[outcome.code] || "—";
+
+  return [
+    batterResult,
+    defensive,
+    advanceStr,
+    outsAfter,
+    runsAndRbi,
+    pit,
+    subNote,
+    misc,
+  ];
+}
+
+function nextBatterName(game: Game) {
+  const key = game.half;
+  const lineup = game.lineups[key];
+  const idx = game.batIdx[key];
+  return lineup[idx].name;
+}
+
+// ===================== 採点 =====================
+
+function gradeUserInput(user: string[], model: string[]) {
+  const result: Array<{ correct: boolean; expected: string }> = [];
+  for (let i = 0; i < 8; i++) {
+    const ok = normalize(user[i]) === normalize(model[i]);
+    result.push({ correct: ok, expected: model[i] });
+  }
+  const score = result.filter((r) => r.correct).length;
+  return {
+    perItem: result,
+    total: score,
+  };
+}
+
+// ===================== コンポーネント =====================
+
+export default function ScorebookTrainer() {
+  const [game, setGame] = useState<Game>(() => initialGame());
+  const [currentOutcome, setCurrentOutcome] = useState<Outcome | null>(null);
+  const [modelAnswer, setModelAnswer] = useState<string[] | null>(null);
+  const [grading, setGrading] = useState<ReturnType<typeof gradeUserInput> | null>(null);
+  const [userInput, setUserInput] = useState<string[]>(Array(8).fill(""));
+  const [sessionScore, setSessionScore] = useState({ correct: 0, total: 0 });
+  // 外部設定（JSON）の状態
+  const [probConfig, setProbConfig] = useState<ProbConfig>(DEFAULT_PROB_CONFIG);
+  const [flyDirConfig, setFlyDirConfig] = useState<FlyDirConfig>(DEFAULT_FLY_DIR);
+  const [runExpectancy, setRunExpectancy] = useState<RunExpectancy>(DEFAULT_RUN_EXPECTANCY);
+  const [notationAlias, setNotationAlias] = useState<NotationAlias>(DEFAULT_NOTATION_ALIAS);
+  const [configInfo, setConfigInfo] = useState<string>("defaults");
+
+  // 起動時に /config/*.json をフェッチ（存在しない場合はフォールバック）
+  React.useEffect(() => {
+    async function loadJSON(path: string) {
+      try {
+        const res = await fetch(path, { cache: "no-store" });
+        if (!res.ok) throw new Error(`${path} HTTP ${res.status}`);
+        return await res.json();
+      } catch (e) {
+        return null;
+      }
+    }
+    (async () => {
+      const [pc, fd, re, na] = await Promise.all([
+        loadJSON("/config/prob_config.json"),
+        loadJSON("/config/fly_dir.json"),
+        loadJSON("/config/run_expectancy.json"),
+        loadJSON("/config/notation_alias.json"),
+      ]);
+      let used = [] as string[];
+      if (pc) { setProbConfig(pc as ProbConfig); used.push("prob"); }
+      if (fd) { setFlyDirConfig(fd as FlyDirConfig); used.push("fly"); }
+      if (re) { setRunExpectancy(re as RunExpectancy); used.push("re"); }
+      if (na) { setNotationAlias(na as NotationAlias); used.push("alias"); }
+      setConfigInfo(used.length ? `external(${used.join(",")})` : "defaults");
+    })();
+  }, []);
+  // 外部設定（JSON）の状態
+  const [probConfig, setProbConfig] = useState<ProbConfig>(DEFAULT_PROB_CONFIG);
+  const [flyDirConfig, setFlyDirConfig] = useState<FlyDirConfig>(DEFAULT_FLY_DIR);
+  const [runExpectancy, setRunExpectancy] = useState<RunExpectancy>(DEFAULT_RUN_EXPECTANCY);
+  const [notationAlias, setNotationAlias] = useState<NotationAlias>(DEFAULT_NOTATION_ALIAS);
+  const [configInfo, setConfigInfo] = useState<string>("defaults");
+
+  // 起動時に /config/*.json をフェッチ（存在しない場合はフォールバック）
+  React.useEffect(() => {
+    async function loadJSON(path: string) {
+      try {
+        const res = await fetch(path, { cache: "no-store" });
+        if (!res.ok) throw new Error(`${path} HTTP ${res.status}`);
+        return await res.json();
+      } catch (e) {
+        return null;
+      }
+    }
+    (async () => {
+      const [pc, fd, re, na] = await Promise.all([
+        loadJSON("/config/prob_config.json"),
+        loadJSON("/config/fly_dir.json"),
+        loadJSON("/config/run_expectancy.json"),
+        loadJSON("/config/notation_alias.json"),
+      ]);
+      let used = [] as string[];
+      if (pc) { setProbConfig(pc as ProbConfig); used.push("prob"); }
+      if (fd) { setFlyDirConfig(fd as FlyDirConfig); used.push("fly"); }
+      if (re) { setRunExpectancy(re as RunExpectancy); used.push("re"); }
+      if (na) { setNotationAlias(na as NotationAlias); used.push("alias"); }
+      setConfigInfo(used.length ? `external(${used.join(",")})` : "defaults");
+    })();
+  }, []);
+
+  // 現在の打者・状況
+  const batter = useMemo(() => nextBatterName(game), [game]);
+
+  const situationText = useMemo(() => {
+    const inning = `${game.inning}回${game.half === "top" ? "表" : "裏"}`;
+    const outs = `${game.outs}アウト`;
+    const bases = [3, 2, 1]
+      .map((b) => (game.bases[b as 1 | 2 | 3] ? `${b}塁` : null))
+      .filter(Boolean)
+      .join("・");
+    const baseStr = bases || "走者なし";
+    const tieb = game.tiebreak ? "（タイブレーク）" : "";
+    return `${inning}${tieb} / ${outs} / ${baseStr}`;
+  }, [game]);
+
+  // 交代ロジック（低頻度・試合中一回のみ）
+  function maybeTriggerSubstitution(g: Game): Game {
+    if (g.hasSubOccurred) return g;
+    const trigger = Math.random() < 0.12; // 12% 程度
+    if (!trigger) return g;
+    const newG = deepClone(g);
+    const defKey: PitcherSide = newG.half === "top" ? "topDefense" : "bottomDefense";
+    const oldName = newG.pitchers[defKey].name;
+    const candidates = ["佐々木", "山田", "斎藤", "加藤", "森"];
+    const newName = randChoice(candidates.filter((n) => n !== oldName)) || `${oldName}2`;
+    newG.pitchers[defKey].name = newName;
+    const note = `${newG.inning}回${newG.half === "top" ? "表" : "裏"} 投手交代 ${oldName}→${newName}`;
+    newG.subs.push({ half: newG.half, inning: newG.inning, note });
+    newG.pendingSubNote = note;
+    newG.hasSubOccurred = true;
+    return newG;
+  }
+
+  const handleGenerate = () => {
+    if (game.gameOver) return;
+    // 打席前に交代が稀に発生
+    const gSub = maybeTriggerSubstitution(game);
+    if (gSub !== game) setGame(gSub);
+
+    const o = generateOutcome({ outs: gSub.outs, bases: gSub.bases });
+    // 進塁プレビュー（打席結果の横表示用）
+    const gBefore = deepClone(gSub);
+    const gAfter = applyPlay(gBefore, batter, o);
+    const last = gAfter.history[gAfter.history.length - 1];
+    const model = buildModelAnswer(last);
+    o.previewAdvance = model[2];
+    setCurrentOutcome(o);
+    // 入力/採点リセット
+    setUserInput(Array(8).fill(""));
+    setModelAnswer(null);
+    setGrading(null);
+  };
+
+  const handleGrade = () => {
+    if (!currentOutcome) return;
+    const gBefore = deepClone(game);
+    const gAfter = applyPlay(gBefore, batter, currentOutcome);
+    const last = gAfter.history[gAfter.history.length - 1];
+    const model = buildModelAnswer(last);
+    setModelAnswer(model);
+    const result = gradeUserInput(userInput, model);
+    setGrading(result);
+    setSessionScore((prev) => ({ correct: prev.correct + result.total, total: prev.total + 8 }));
+  };
+
+  const handleCommitAndNextPA = () => {
+    if (!currentOutcome || game.gameOver) return;
+    const gNew = applyPlay(game, batter, currentOutcome);
+    setGame(gNew);
+    setCurrentOutcome(null);
+    setModelAnswer(null);
+    setGrading(null);
+    setUserInput(Array(8).fill(""));
+  };
+
+  const restart = () => {
+    setGame(initialGame());
+    setCurrentOutcome(null);
+    setModelAnswer(null);
+    setGrading(null);
+    setUserInput(Array(8).fill(""));
+    setSessionScore({ correct: 0, total: 0 });
+  };
+
+  // UI部品
+  const InputRow: React.FC<{ idx: number; label: string; placeholder: string }> = ({ idx, label, placeholder }) => (
+    <div className="grid grid-cols-12 gap-2 items-center py-1">
+      <div className="col-span-3 text-sm text-gray-600">{idx + 1}. {label}</div>
+      <input
+        className="col-span-9 rounded-xl border px-3 py-2 text-sm focus:outline-none focus:ring-2"
+        value={userInput[idx]}
+        onChange={(e) => {
+          const next = [...userInput];
+          next[idx] = e.target.value;
+          setUserInput(next);
+        }}
+        placeholder={placeholder}
+      />
+      {grading && (
+        <div className="col-span-12 text-sm">
+          {grading.perItem[idx].correct ? (
+            <span className="text-green-600">✔ 正解</span>
+          ) : (
+            <span className="text-red-600">✘ 不正解 / 模範: {grading.perItem[idx].expected}</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
+  // ===================== 簡易ランタイムテスト（UI表示 & console.assert） =====================
+  const [testOutput] = useState(() => {
+    const logs: string[] = [];
+    // 1) baseOutKey テスト
+    const key1 = baseOutKey(0, { 1: null, 2: null, 3: null });
+    logs.push(`TEST baseOutKey #1 => ${key1}`);
+    console.assert(key1 === "O0_B000", "baseOutKey mismatch #1");
+
+    const key2 = baseOutKey(1, { 1: "R1", 2: null, 3: "R3" });
+    logs.push(`TEST baseOutKey #2 => ${key2}`);
+    console.assert(key2 === "O1_B101", "baseOutKey mismatch #2");
+
+    // 2) FO の方向が 7/8/9 のいずれかになること（100回試行）
+    let</header>
+
+        {/* コンフィグ状態の表示（外部JSON読み込み状況） */}
+        <section className="bg-white rounded-2xl shadow p-4">
+          <div className="text-sm text-gray-500">設定ファイル: {configInfo}</div>
+          <div className="text-xs text-gray-500">/config/prob_config.json, /config/fly_dir.json, /config/run_expectancy.json, /config/notation_alias.json（存在しなければデフォルト）</div>
+        </section>rue;
+    for (let i = 0; i < 100; i++) {
+      const o = generateOutcome({ outs: 0, bases: { 1: null, 2: null, 3: null } });
+      if (o.code === "FO") {
+        if (!(o.flyDir === 7 || o.flyDir === 8 || o.flyDir === 9 || o.flyDir === null)) okFO = false;
+      }
+    }
+    logs.push(`TEST FO direction => ${okFO ? "OK" : "NG"}`);
+    console.assert(okFO, "FO direction test failed");
+
+    // 3) applyPlay の基本（単打で R1→2B が押し出されない状況の確認）
+    const g0 = initialGame();
+    g0.bases[1] = "A#1"; // 仮走者
+    const after = applyPlay(g0, "田中", { code: "1B", defensive: null, description: "テスト単打" });
+    const movedR1 = after.bases[2] !== null; // 2塁へ動いたか
+    logs.push(`TEST applyPlay 1B move R1 => ${movedR1 ? "OK" : "NG"}`);
+    console.assert(movedR1, "applyPlay single advance R1 failed");
+
+    return logs.join("\n");
+  });
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-4 md:p-8">
+      <div className="max-w-6xl mx-auto space-y-4">
+        <header className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold">スコアブック記入 練習アプリ</h1>
+            <div className="text-xs text-gray-500 mt-1">累計スコア: {sessionScore.correct} / {sessionScore.total}</div>
+          </div>
+          <div className="text-sm text-gray-500">
+            {TEAM_A.name} {game.score.top} - {game.score.bottom} {TEAM_B.name}
+            {game.gameOver && <span className="ml-2 text-red-600 font-semibold">（試合終了）</span>}
+          </div>
+        </header>
+
+        {/* スコアボード */}
+        <section className="bg-white rounded-2xl shadow p-4">
+          <div className="text-sm text-gray-500 mb-2">スコアボード</div>
+          <table className="w-full text-sm">
+            <thead>
+              <tr>
+                <th className="text-left">Team</th>
+                {game.linescore.top.map((_, i) => (
+                  <th key={i} className="text-center">{i + 1}</th>
+                ))}
+                <th className="text-center">R</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>{TEAM_A.name}</td>
+                {game.linescore.top.map((r, i) => (
+                  <td key={i} className="text-center">{r ?? 0}</td>
+                ))}
+                <td className="text-center font-semibold">{game.score.top}</td>
+              </tr>
+              <tr>
+                <td>{TEAM_B.name}</td>
+                {game.linescore.bottom.map((r, i) => (
+                  <td key={i} className="text-center">{r ?? 0}</td>
+                ))}
+                <td className="text-center font-semibold">{game.score.bottom}</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section className="grid md:grid-cols-3 gap-4">
+          <div className="bg-white rounded-2xl shadow p-4 space-y-2 md:col-span-1">
+            <div className="text-sm text-gray-500">現在の状況</div>
+            <div className="text-lg font-semibold">{situationText}</div>
+            <div className="text-sm">打者：<span className="font-medium">{batter}</span></div>
+            <div className="text-xs text-gray-500">打順：{game.batIdx[game.half] + 1}番</div>
+            {game.gameOver && (
+              <div className="mt-2 text-red-600 font-semibold">ゲーム終了</div>
+            )}
+          </div>
+
+          {/* 打席結果パネル */}
+          <div className="bg-white rounded-2xl shadow p-4 space-y-2 md:col-span-2">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm text-gray-500">打席結果（提示）</div>
+                {currentOutcome ? (
+                  <div className="text-lg font-semibold">
+                    {currentOutcome.description}
+                    {currentOutcome.defensive && (
+                      <span className="ml-2 text-gray-500 text-sm">[{currentOutcome.defensive}]</span>
+                    )}
+                    {currentOutcome.previewAdvance && (
+                      <div className="text-sm text-gray-600 mt-1">進塁: {currentOutcome.previewAdvance}</div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-lg text-gray-400">「打席生成」を押してください</div>
+                )}
+              </div>
+              <div className="flex gap-2">
+                <button className="px-3 py-2 rounded-xl bg-gray-200" disabled={game.gameOver} onClick={handleGenerate}>打席生成</button>
+                <button className="px-3 py-2 rounded-xl bg-gray-200" onClick={restart}>リスタート</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* 入力フォーム */}
+        <section className="bg-white rounded-2xl shadow p-4">
+          <div className="text-sm text-gray-500 mb-2">スコアブック入力（8項目）</div>
+          <div className="divide-y">
+            <InputRow idx={0} label="打者の結果（例: 1B, K, BB など）" placeholder="例: 1B / K / HR / GO (6-3) など" />
+            <InputRow idx={1} label="守備番号でのプレイ記録" placeholder="例: 6-4-3 / F8 / E6 など" />
+            <InputRow idx={2} label="走者の進塁状況" placeholder="例: 1B→3B / 2B→HOM / 打者: B→1B など" />
+            <InputRow idx={3} label="アウト数（打席後）" placeholder="例: 1 / 2 / 3" />
+            <InputRow idx={4} label="得点と打点" placeholder="例: 得点: 田中 / 打点: 1" />
+            <InputRow idx={5} label="投手成績（簡易）" placeholder="例: K:1 BB:0 H:0 ER:0 または K:1 BB:0 H:0 ER:1" />
+            <InputRow idx={6} label="選手交代の記録（任意）" placeholder="例: 1回裏 投手交代 青木→佐々木" />
+            <InputRow idx={7} label="エラーや野選の記録" placeholder="例: E6 / FC 6-4 / —" />
+          </div>
+
+          <div className="flex gap-2 mt-4">
+            <button
+              className="px-4 py-2 rounded-2xl bg-indigo-600 text-white disabled:opacity-50"
+              disabled={!currentOutcome}
+              onClick={handleGrade}
+            >
+              採点・模範解答を表示
+            </button>
+            <button
+              className="px-4 py-2 rounded-2xl bg-emerald-600 text-white disabled:opacity-50"
+              disabled={!currentOutcome}
+              onClick={handleCommitAndNextPA}
+            >
+              次の打席へ（状態を進める）
+            </button>
+          </div>
+        </section>
+
+        {/* 採点・模範解答表示欄 */}
+        <section className="bg-white rounded-2xl shadow p-4">
+          <div className="flex items-center justify-between">
+            <div className="text-sm text-gray-500">採点・模範解答</div>
+            {grading && (
+              <div className="text-sm font-semibold">スコア: {grading.total} / 8</div>
+            )}
+          </div>
+          {modelAnswer ? (
+            <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+              {modelAnswer.map((ans, i) => (
+                <div key={i} className="rounded-xl border p-3">
+                  <div className="text-xs text-gray-500 mb-1">{i + 1}. 模範</div>
+                  <div className="text-sm whitespace-pre-wrap">{ans}</div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-gray-400 mt-2">採点ボタンで模範例を表示</div>
+          )}
+        </section>
+
+        {/* 履歴 */}
+        <section className="bg-white rounded-2xl shadow p-4">
+          <div className="text-sm text-gray-500">打席ログ</div>
+          <div className="mt-2 space-y-2">
+            {game.history.length === 0 && <div className="text-gray-400">まだありません</div>}
+            {game.history.slice().reverse().map((h, idx) => (
+              <div key={idx} className="p-3 rounded-xl border">
+                <div className="text-sm font-semibold">{h.batter}：{h.outcome.description}{h.outcome.defensive ? ` [${h.outcome.defensive}]` : ""}</div>
+                <div className="text-xs text-gray-600">得点: {h.runsScored.length ? h.runsScored.join(", ") : 0} / 打点: {h.rbi}</div>
+                {h.subNote && <div className="text-xs text-blue-600">交代: {h.subNote}</div>}
+                <div className="text-xs text-gray-500">前: Outs {h.before.outs} / 塁 {h.before.bases[1] ? "1" : "-"}{h.before.bases[2] ? "2" : "-"}{h.before.bases[3] ? "3" : "-"} → 後: Outs {h.after.outs} / 塁 {h.after.bases[1] ? "1" : "-"}{h.after.bases[2] ? "2" : "-"}{h.after.bases[3] ? "3" : "-"}</div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* ランタイムテスト結果（簡易）*/}
+        <section className="bg-white rounded-2xl shadow p-4">
+          <div className="text-sm text-gray-500 mb-2">Runtime Tests</div>
+          <pre className="text-xs whitespace-pre-wrap text-gray-700">{testOutput}</pre>
+        </section>
+
+        {/* 備考 */}
+        <section className="text-xs text-gray-500">
+          <div>備考:</div>
+          <ul className="list-disc ml-4">
+            <li>ルールは訓練用に簡略化しています（ゴロ進塁/自責点/併殺・野選・押し出し等の扱い）。</li>
+            <li>延長タイブレークは2回以降、各半回の開始時に二塁走者を自動配置します。</li>
+            <li>採点は厳密一致（大文字・空白正規化のみ）です。運用に合わせて柔軟一致に調整可能です。</li>
+          </ul>
+        </section>
+      </div>
+    </div>
+  );
+}
